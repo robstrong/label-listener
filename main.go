@@ -17,7 +17,7 @@ const (
 )
 
 var (
-	addr = flag.String("docker-addr", "", "")
+	addr = flag.String("docker-addr", "unix:///var/run/docker.sock", "")
 
 	services   = map[string]*Service{}
 	servicesMu = sync.Mutex{}
