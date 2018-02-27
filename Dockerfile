@@ -6,4 +6,4 @@ RUN cd /go/src/github.com/robstrong/label-listener/ && CGO_ENABLED=0 go build -o
 # final stage
 FROM alpine
 COPY --from=build-env /go/src/github.com/robstrong/label-listener/goapp /app/
-ENTRYPOINT /app/goapp
+ENTRYPOINT ["/app/goapp"]

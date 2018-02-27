@@ -5,7 +5,11 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsouza/go-dockerclient"
@@ -17,14 +21,15 @@ const (
 )
 
 var (
-	addr = flag.String("docker-addr", "unix:///var/run/docker.sock", "")
+	addr     = flag.String("docker-addr", "unix:///var/run/docker.sock", "")
 	httpPort = flag.String("http-port", ":80", "")
 
 	services   = map[string]*Service{}
 	servicesMu = sync.Mutex{}
 	serviceTTL = time.Minute
 
-	nextCacheClear = time.Now().Add(serviceTTL)
+	nextCacheClear         = time.Now().Add(serviceTTL)
+	checkContainerInterval = time.Second * 10
 )
 
 func main() {
@@ -34,13 +39,24 @@ func main() {
 
 	//start docker endpoint listener
 	log.Println("starting docker listener")
-	go serviceCache(startDockerListener(*addr, containerFilterAll))
+	go serviceCache(startDockerListener(*addr), hasServiceLabels)
 
 	//start http server
-	log.Printf("starting http server on %d\n", *httpPort)
+	log.Printf("starting http server on %s\n", *httpPort)
 	err := http.ListenAndServe(*httpPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Println("http request received")
-		b, err := json.Marshal(r)
+		servicesMu.Lock()
+		serviceList := make([]*Service, len(services))
+		i := 0
+		for _, s := range services {
+			serviceList[i] = s
+			i++
+		}
+		servicesMu.Unlock()
+
+		sort.Sort(ByName(serviceList))
+
+		b, err := json.Marshal(serviceList)
 		if err != nil {
 			log.Printf("error marshalling json: %v", err)
 		}
@@ -52,12 +68,18 @@ func main() {
 	}
 }
 
+type ByName []*Service
+
+func (a ByName) Len() int           { return len(a) }
+func (a ByName) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByName) Less(i, j int) bool { return a[i].Name < a[j].Name }
+
 func handleShutdownSignals() {
 	signalCh := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGTERM)
-	signal.Notify(c, os.Interrupt)
+	signal.Notify(signalCh, syscall.SIGTERM)
+	signal.Notify(signalCh, os.Interrupt)
 	go func() {
-		for s := range signalCh {
+		for range signalCh {
 			os.Exit(0)
 		}
 	}()
@@ -65,27 +87,26 @@ func handleShutdownSignals() {
 
 type containerFilter func(c docker.APIContainers) bool
 
-func containerFilterAll(c docker.APIContainers) bool {
-	return true
+func hasServiceLabels(c docker.APIContainers) bool {
+	if c.Labels[ServiceHost] != "" && c.Labels[ServiceName] != "" {
+		return true
+	}
+	return false
 }
 
-func startDockerListener(addr string, filter containerFilter) chan docker.APIContainers {
+func startDockerListener(addr string) chan docker.APIContainers {
 	client, err := docker.NewClient(addr)
 	if err != nil {
 		log.Fatalf("could not connect to docker: %v", err)
 	}
 	containerCh := make(chan docker.APIContainers, 1)
 	go func(client *docker.Client) {
-		for range time.Tick(time.Minute) {
+		for range time.Tick(checkContainerInterval) {
 			containers, err := client.ListContainers(docker.ListContainersOptions{All: false})
 			if err != nil {
 				log.Fatalf("could not list containers: %v", err)
 			}
-			log.Printf("found %d docker containers", len(containers))
 			for _, c := range containers {
-				if filter != nil && !filter(c) {
-						continue
-				}
 				containerCh <- c
 			}
 		}
@@ -94,13 +115,20 @@ func startDockerListener(addr string, filter containerFilter) chan docker.APICon
 	return containerCh
 }
 
-func serviceCache(c chan docker.APIContainers) {
+func serviceCache(c chan docker.APIContainers, filter containerFilter) {
 	for s := range c {
+		if !filter(s) {
+			continue
+		}
+
 		servicesMu.Lock()
 		if nextCacheClear.Before(time.Now()) {
 			clearCache()
 		}
 
+		if _, ok := services[s.Labels[ServiceHost]]; !ok {
+			log.Printf("found new service: %s (%s)\n", s.Labels[ServiceName], s.Labels[ServiceHost])
+		}
 		services[s.Labels[ServiceHost]] = &Service{
 			lastUpdated: time.Now().Add(serviceTTL),
 			Addr:        s.Labels[ServiceHost],
