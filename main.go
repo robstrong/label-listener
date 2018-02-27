@@ -18,6 +18,7 @@ const (
 
 var (
 	addr = flag.String("docker-addr", "unix:///var/run/docker.sock", "")
+	httpPort = flag.String("http-port", ":80", "")
 
 	services   = map[string]*Service{}
 	servicesMu = sync.Mutex{}
@@ -29,11 +30,16 @@ var (
 func main() {
 	flag.Parse()
 
+	handleShutdownSignals()
+
 	//start docker endpoint listener
+	log.Println("starting docker listener")
 	go serviceCache(startDockerListener(*addr, containerFilterAll))
 
 	//start http server
-	err := http.ListenAndServe(*addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	log.Printf("starting http server on %d\n", *httpPort)
+	err := http.ListenAndServe(*httpPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Println("http request received")
 		b, err := json.Marshal(r)
 		if err != nil {
 			log.Printf("error marshalling json: %v", err)
@@ -44,6 +50,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("error: %v", err)
 	}
+}
+
+func handleShutdownSignals() {
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGTERM)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for s := range signalCh {
+			os.Exit(0)
+		}
+	}()
 }
 
 type containerFilter func(c docker.APIContainers) bool
@@ -64,11 +81,10 @@ func startDockerListener(addr string, filter containerFilter) chan docker.APICon
 			if err != nil {
 				log.Fatalf("could not list containers: %v", err)
 			}
+			log.Printf("found %d docker containers", len(containers))
 			for _, c := range containers {
-				if filter != nil {
-					if !filter(c) {
+				if filter != nil && !filter(c) {
 						continue
-					}
 				}
 				containerCh <- c
 			}
